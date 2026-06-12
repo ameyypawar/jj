@@ -80,7 +80,6 @@ use crate::op_store::RefTarget;
 use crate::op_store::RemoteRef;
 use crate::op_store::RemoteRefState;
 use crate::op_store::RootOperationData;
-use crate::op_walk;
 use crate::operation::Operation;
 use crate::ref_name::GitRefName;
 use crate::ref_name::RefName;
@@ -766,10 +765,17 @@ impl RepoLoader {
         let op = op_heads_store::resolve_op_heads(
             self.op_heads_store.as_ref(),
             &self.op_store,
-            async |op_heads| {
-                assert!(!op_heads.is_empty());
-                self.merge_operations(op_heads, Some("reconcile divergent operations"))
-                    .await
+            async |op_heads| -> Result<Operation, RepoLoaderError> {
+                assert!(op_heads.len() > 1);
+                let (merged_repo, _num_rebased) = Transaction::merge_operations(
+                    self,
+                    op_heads,
+                    None,
+                    &[],
+                    Some("reconcile divergent operations"),
+                )
+                .await?;
+                Ok(merged_repo.operation().clone())
             },
         )
         .await?;
@@ -813,111 +819,6 @@ impl RepoLoader {
     pub async fn load_operation(&self, id: &OperationId) -> OpStoreResult<Operation> {
         let data = self.op_store.read_operation(id).await?;
         Ok(Operation::new(self.op_store.clone(), id.clone(), data))
-    }
-
-    /// Merges the given `operations` into a single operation. Returns the root
-    /// operation if the `operations` is empty.
-    pub async fn merge_operations(
-        &self,
-        operations: Vec<Operation>,
-        tx_description: Option<&str>,
-    ) -> Result<Operation, RepoLoaderError> {
-        match &operations[..] {
-            [] => {
-                return Ok(self.root_operation().await);
-            }
-            [operation] => {
-                return Ok(operation.clone());
-            }
-            _ => {}
-        }
-
-        let to_operation_ids =
-            |ops: &[Operation]| ops.iter().map(|op| op.id().clone()).collect_vec();
-        let operation_ids = to_operation_ids(&operations);
-
-        // Caches the result of merging some operations.
-        let mut merged_operations: HashMap<Vec<OperationId>, Operation> = HashMap::new();
-        // Caches the result of op_walk::closest_common_ancestors invocations. Keyed by
-        // the arguments to that method.
-        let mut closest_common_ancestors: HashMap<_, Vec<Operation>> = HashMap::new();
-
-        let tx = self.load_at(&operations[0]).await?.start_transaction();
-        let mut stack = vec![(1, operations, tx)];
-
-        while let Some((index, operations, mut tx)) = stack.pop() {
-            assert!(operations.len() > 1);
-            assert!(index <= operations.len());
-            if index == operations.len() {
-                // We are done processing the operations. Commit the transaction and cache the
-                // result.
-                let tx_description = tx_description.map_or_else(
-                    || format!("merge {} operations", operations.len()),
-                    |tx_description| tx_description.to_string(),
-                );
-                let merged_repo = tx.write(tx_description).await?.leave_unpublished();
-                merged_operations.insert(
-                    to_operation_ids(&operations),
-                    merged_repo.operation().clone(),
-                );
-                continue;
-            }
-
-            let other_op = &operations[index];
-
-            // Get the ancestor operations between the operations we have merged so far
-            // (represented by `tx.parent_ops()`) and the next operation to merge
-            // (`other_op`).
-            let ancestor_ops = match closest_common_ancestors
-                .entry((to_operation_ids(tx.parent_ops()), other_op.id().clone()))
-            {
-                Entry::Occupied(occupied_entry) => occupied_entry.into_mut(),
-                Entry::Vacant(vacant_entry) => {
-                    let ancestor_ops = op_walk::closest_common_ancestors(
-                        tx.parent_ops().iter().cloned(),
-                        [other_op.clone()],
-                    )
-                    .await?;
-                    vacant_entry.insert(ancestor_ops.clone())
-                }
-            };
-            assert!(!ancestor_ops.is_empty());
-
-            let ancestor_op = if let [ancestor_op] = ancestor_ops.as_slice() {
-                // There is a single common ancestor.
-                Some(ancestor_op)
-            } else {
-                // There are multiple common ancestors, check to see if we have cached their
-                // merge result.
-                let ancestor_op_ids = ancestor_ops.iter().map(|op| op.id().clone()).collect_vec();
-                merged_operations.get(&ancestor_op_ids)
-            };
-
-            if let Some(merged_ancestor_op) = ancestor_op {
-                // We have the merge of the ancestor operations. We can proceed to merge with
-                // other_op.
-                let ancestor_op_repo = self.load_at(merged_ancestor_op).await?;
-                let other_repo = self.load_at(other_op).await?;
-                tx.push_parent_op(other_op.clone());
-                tx.repo_mut().merge(&ancestor_op_repo, &other_repo).await?;
-                tx.repo_mut().rebase_descendants().await?;
-                // Push state on the stack to continue merging the rest of the operations.
-                stack.push((index + 1, operations, tx));
-                continue;
-            }
-
-            // We have to merge the ancestor ops.
-            // We first push the current state to the stack so that after we merge the
-            // ancestor ops, we can continue merging the rest of the operations.
-            stack.push((index, operations, tx));
-            // Then we push the ancestor ops to the stack so that we can merge them first.
-            // We need to start a separate transaction for this.
-            let new_tx = self.load_at(&ancestor_ops[0]).await?.start_transaction();
-            stack.push((1, ancestor_ops.clone(), new_tx));
-        }
-
-        // We are all done! The result should be in the cache.
-        Ok(merged_operations.get(&operation_ids).cloned().unwrap())
     }
 
     async fn finish_load(

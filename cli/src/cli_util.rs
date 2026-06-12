@@ -131,6 +131,7 @@ use jj_lib::str_util::StringMatcher;
 use jj_lib::str_util::StringPattern;
 use jj_lib::transaction::Transaction;
 use jj_lib::transaction::TransactionCommitError;
+use jj_lib::transaction::start_repo_transaction;
 use jj_lib::working_copy;
 use jj_lib::working_copy::CheckoutStats;
 use jj_lib::working_copy::LockedWorkingCopy;
@@ -730,27 +731,16 @@ impl CommandHelper {
                         ui.status(),
                         "Concurrent modification detected, resolving automatically.",
                     )?;
-                    let base_repo = repo_loader.load_at(&op_heads[0]).block_on()?;
                     // TODO: It may be helpful to print each operation we're merging here
-                    let mut tx =
-                        start_repo_transaction(&base_repo, workspace_name, &self.data.string_args);
-                    for other_op_head in op_heads.into_iter().skip(1) {
-                        tx.merge_operation(other_op_head).await?;
-                        let num_rebased = tx.repo_mut().rebase_descendants().await?;
-                        if num_rebased > 0 {
-                            writeln!(
-                                ui.status(),
-                                "Rebased {num_rebased} descendant commits onto commits rewritten \
-                                 by other operation"
-                            )?;
-                        }
-                    }
-                    Ok(tx
-                        .write("reconcile divergent operations")
-                        .await?
-                        .leave_unpublished()
-                        .operation()
-                        .clone())
+                    merge_operations(
+                        Some(ui),
+                        repo_loader,
+                        op_heads,
+                        Some(workspace_name),
+                        &self.data.string_args,
+                        Some("reconcile divergent operations"),
+                    )
+                    .await
                 },
             )
             .block_on()
@@ -771,6 +761,36 @@ impl CommandHelper {
         let loaded_at_head = true;
         WorkspaceCommandHelper::new(ui, workspace, repo, env, loaded_at_head)
     }
+}
+
+/// If `operations` is empty returns the root operation, if it contains a single
+/// entry returns that entry, otherwise merges the operations into a single
+/// operation. If `ui` is set, reports the number of rebased descendants.
+pub async fn merge_operations(
+    ui: Option<&Ui>,
+    repo_loader: &RepoLoader,
+    operations: Vec<Operation>,
+    workspace_name: Option<&WorkspaceName>,
+    string_args: &[String],
+    tx_description: Option<&str>,
+) -> Result<Operation, CommandError> {
+    let (merged_repo, num_rebased) = Transaction::merge_operations(
+        repo_loader,
+        operations,
+        workspace_name,
+        string_args,
+        tx_description,
+    )
+    .await?;
+    if let Some(ui) = ui
+        && num_rebased > 0
+    {
+        writeln!(
+            ui.status(),
+            "Rebased {num_rebased} descendant commits onto commits rewritten by other operation",
+        )?;
+    }
+    Ok(merged_repo.operation().clone())
 }
 
 /// A ReadonlyRepo along with user-config-dependent derived data. The derived
@@ -2030,7 +2050,7 @@ to the current parents may contain changes from multiple commits.
         if new_tree.tree_ids_and_labels() != wc_commit.tree().tree_ids_and_labels() {
             let mut tx = start_repo_transaction(
                 &self.user_repo.repo,
-                &workspace_name,
+                Some(&workspace_name),
                 self.env.command.string_args(),
             );
             tx.set_is_snapshot(true);
@@ -2207,7 +2227,7 @@ to the current parents may contain changes from multiple commits.
     pub fn start_transaction(&mut self) -> WorkspaceCommandTransaction<'_> {
         let tx = start_repo_transaction(
             self.repo(),
-            self.workspace_name(),
+            Some(self.workspace_name()),
             self.env.command.string_args(),
         );
         let id_prefix_context = mem::take(&mut self.user_repo.id_prefix_context);
@@ -2772,41 +2792,6 @@ jj git init",
         WorkspaceLoadError::WorkingCopyState(err) => internal_error(err),
         WorkspaceLoadError::DecodeRepoPath(_) | WorkspaceLoadError::Path(_) => user_error(err),
     }
-}
-
-pub fn start_repo_transaction(
-    repo: &Arc<ReadonlyRepo>,
-    workspace_name: &WorkspaceName,
-    string_args: &[String],
-) -> Transaction {
-    let mut tx = repo.start_transaction();
-    tx.set_workspace_name(workspace_name);
-    // TODO: Either do better shell-escaping here or store the values in some list
-    // type (which we currently don't have).
-    let shell_escape = |arg: &String| {
-        if arg.as_bytes().iter().all(|b| {
-            matches!(b,
-                b'A'..=b'Z'
-                | b'a'..=b'z'
-                | b'0'..=b'9'
-                | b','
-                | b'-'
-                | b'.'
-                | b'/'
-                | b':'
-                | b'@'
-                | b'_'
-            )
-        }) {
-            arg.clone()
-        } else {
-            format!("'{}'", arg.replace('\'', "\\'"))
-        }
-    };
-    let mut quoted_strings = vec!["jj".to_string()];
-    quoted_strings.extend(string_args.iter().skip(1).map(shell_escape));
-    tx.set_attribute("args".to_string(), quoted_strings.join(" "));
-    tx
 }
 
 /// Check if the working copy is stale and reload the repo if the repo is ahead
